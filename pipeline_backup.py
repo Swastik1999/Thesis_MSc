@@ -1,6 +1,5 @@
 # pipeline.py
 from collections import defaultdict
-import math
 import os
 
 cuda_bin = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin"
@@ -12,7 +11,7 @@ import json
 import pickle
 import re
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 from config import GlobalConfig
 from embeddings import LocalOllamaEmbeddings
@@ -179,105 +178,8 @@ def reciprocal_rank_fusion(
     )
     return [doc_mapping[k] for k in sorted_docs[:top_k]]
 
-
 # =====================================================================
-# 2.5 CROSS-RETRIEVER DEDUPLICATION
-# =====================================================================
-# Two chunks are treated as duplicates when they share at least
-# GlobalConfig.DEDUP_OVERLAP_THRESHOLD token overlap.
-# reciprocal_rank_fusion() already merges *exact* page_content matches via
-# its scoring dict, but near-duplicates (e.g. the same passage split at
-# slightly different chunk boundaries, or a chunk that's simply a subset
-# of another) show up as distinct entries there -- this catches those
-# before fusion happens. When duplicates are found, whichever copy has
-# the BETTER RANK in its own retrieval list is kept -- neither dense nor
-# sparse is treated as inherently more trustworthy.
-
-
-def normalize_text(text: str) -> str:
-    """
-    Normalizes text to lowercase, replacing non-alphanumeric characters
-    and newlines with a single space for reliable token comparison.
-    """
-    if not text:
-        return ""
-    return re.sub(r'\W+', ' ', text).lower().strip()
-
-
-def calculate_token_overlap(text_a: str, text_b: str) -> float:
-    """
-    Returns shared tokens as a fraction of the SMALLER chunk's unique
-    token count. Using the smaller side (rather than always dividing by
-    one fixed "reference" text) means a short chunk fully contained inside
-    a longer one is still flagged as a near-duplicate, even though the
-    longer chunk's own overlap ratio would come out low.
-    """
-    tokens_a = set(normalize_text(text_a).split())
-    tokens_b = set(normalize_text(text_b).split())
-    if not tokens_a or not tokens_b:
-        return 0.0
-    intersection = tokens_a & tokens_b
-    smaller_len = min(len(tokens_a), len(tokens_b))
-    return len(intersection) / smaller_len
-
-
-def deduplicate_dense_sparse(
-    dense_docs: List[Document],
-    splade_docs: List[Document],
-    threshold: float = None,
-) -> Tuple[List[Document], List[Document]]:
-    """
-    Removes near-duplicate chunks between (and within) the dense and sparse
-    candidate lists before RRF fusion, so a passage retrieved by both
-    methods -- or the same passage retrieved twice under slightly
-    different chunk boundaries -- doesn't quietly eat two slots in the
-    fused top_k.
-
-    `threshold` defaults to GlobalConfig.DEDUP_OVERLAP_THRESHOLD (falling
-    back to 0.50 if that field isn't defined in config.py) when the caller
-    doesn't pass one explicitly, so the cutoff can be tuned from config.py
-    without touching this function.
-
-    RANK-BASED RESOLUTION: when two chunks (whether from the same list or
-    across dense/sparse) are near-duplicates, the one with the BETTER
-    (lower-numbered, i.e. more highly ranked) position in its own list
-    wins, regardless of which retriever produced it. On an exact rank tie
-    between the two lists, dense wins as a rare tie-break.
-
-    Each list's relative rank order is preserved in the returned lists
-    (surviving entries are compacted -- no gaps left where a duplicate was
-    removed).
-    """
-    if threshold is None:
-        threshold = getattr(GlobalConfig, "DEDUP_OVERLAP_THRESHOLD", 0.50)
-
-    # Tag every candidate with its source list and its rank (0 = best)
-    # within that list, then merge into one pool ordered best-rank-first
-    # across both lists combined. Python's sort is stable, so on an exact
-    # rank tie the dense entry (appended to the pool first) is considered
-    # before the sparse one.
-    candidates = (
-        [{"doc": doc, "source": "dense", "rank": rank} for rank, doc in enumerate(dense_docs)]
-        + [{"doc": doc, "source": "sparse", "rank": rank} for rank, doc in enumerate(splade_docs)]
-    )
-    candidates.sort(key=lambda c: c["rank"])
-
-    kept: List[dict] = []
-    for cand in candidates:
-        if not any(
-            calculate_token_overlap(cand["doc"].page_content, k["doc"].page_content) >= threshold
-            for k in kept
-        ):
-            kept.append(cand)
-
-    deduped_dense = [c["doc"] for c in kept if c["source"] == "dense"]
-    deduped_sparse = [c["doc"] for c in kept if c["source"] == "sparse"]
-
-    return deduped_dense, deduped_sparse
-
-
-# =====================================================================
-# 2.6 QUERY PROCESSING: EXPANSION (for sparse) + HyDE (for dense)
+# 2.5 QUERY PROCESSING: EXPANSION (for sparse) + HyDE (for dense)
 # =====================================================================
 def expand_query(query: str, llm_model: str, num_expansions: int = 5) -> str:
     """Generates related terms/synonyms via LLM and appends them to the
@@ -329,119 +231,6 @@ def generate_hyde_document(query: str, llm_model: str) -> str:
     except Exception as e:
         print(f"[WARNING] HyDE generation failed ({e}). Falling back to raw query.")
         return query
-
-
-# =====================================================================
-# 2.7 RELEVANCY SCORING & FILTERING
-# =====================================================================
-# Runs AFTER cross-retriever deduplication (2.5): each surviving chunk is
-# scored for semantic relevance against the RAW user query using the same
-# embedding model that powers dense retrieval, and chunks scoring below
-# GlobalConfig.RELEVANCE_SCORE_THRESHOLD are dropped before RRF fusion.
-# Scoring dense-sourced and sparse-sourced chunks with the SAME embedding
-# model (rather than trusting each retriever's own internal score, which
-# live on different, non-comparable scales) makes the cutoff directly
-# comparable across both sources.
-#
-# This whole stage is gated by GlobalConfig.RELEVANCE_FILTERING_ENABLED at
-# the call site in generate_single_response() (and retrieve_all_stages()
-# in retrieval_eval.py) -- when disabled, filter_by_relevance() is never
-# called at all, so no extra embedding calls happen. A threshold of 0.0
-# alone is NOT a substitute for this: it still runs the embedding +
-# scoring work, it just happens to let almost everything through.
-
-
-def cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
-    """Plain-Python cosine similarity -- no numpy dependency needed at the
-    modest vector counts involved here (post-dedup candidate pool)."""
-    dot = sum(a * b for a, b in zip(vec_a, vec_b))
-    norm_a = math.sqrt(sum(a * a for a in vec_a))
-    norm_b = math.sqrt(sum(b * b for b in vec_b))
-    if norm_a == 0.0 or norm_b == 0.0:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-
-def resolve_embedder(vectorstore, embedding_model: str):
-    """
-    Returns the embedding model instance backing `vectorstore` (via its
-    standard LangChain `.embeddings` property), falling back to
-    constructing a fresh LocalOllamaEmbeddings if the vectorstore doesn't
-    expose one. Used to get an embedder for filter_by_relevance() without
-    needing every caller to re-derive it by hand.
-    """
-    embedder = getattr(vectorstore, "embeddings", None)
-    if embedder is not None:
-        return embedder
-    try:
-        return LocalOllamaEmbeddings(model=embedding_model)
-    except TypeError:
-        return LocalOllamaEmbeddings(model_name=embedding_model)
-
-
-def filter_by_relevance(
-    query: str,
-    dense_docs: List[Document],
-    splade_docs: List[Document],
-    embeddings,
-    threshold: float = None,
-) -> Tuple[List[Document], List[Document]]:
-    """
-    Scores every (post-dedup) dense and sparse chunk against the RAW user
-    query using `embeddings` (the same embedding model backing dense
-    retrieval), and drops any chunk scoring below `threshold`.
-
-    `threshold` defaults to GlobalConfig.RELEVANCE_SCORE_THRESHOLD (falling
-    back to 0.0 -- effectively no filtering -- if that field isn't defined
-    in config.py), so a fresh config.py doesn't silently start dropping
-    chunks until a threshold is deliberately set and tuned.
-
-    Whether this function gets CALLED AT ALL is controlled separately by
-    GlobalConfig.RELEVANCE_FILTERING_ENABLED at each call site -- this
-    function itself has no enabled/disabled concept and will always do the
-    embedding + scoring work when invoked.
-
-    NOTE: dense_docs were already embedded once during ingestion, so
-    re-embedding them here duplicates a little work; this trades a small
-    amount of redundant compute for a simple, uniform scoring path across
-    both sources. Fine at these candidate-pool sizes (tens of chunks).
-
-    NOTE: this scores against the raw query, not a HyDE-expanded one, even
-    if HyDE was used for retrieval -- a short question can score lower
-    against a long passage than the HyDE passage would, purely due to
-    query/document length asymmetry. Keep that in mind if you enable HyDE
-    and this filter together.
-
-    SAFETY NET: if filtering would empty out a list entirely, the single
-    highest-scoring chunk from that list is kept anyway, so an
-    overly-strict threshold (or a genuinely hard query) can't zero out the
-    candidate pool and starve RRF/critique/generation of any context at
-    all.
-
-    Rank order within each surviving list is preserved.
-    """
-    if threshold is None:
-        threshold = getattr(GlobalConfig, "RELEVANCE_SCORE_THRESHOLD", 0.0)
-
-    query_vec = embeddings.embed_query(query)
-
-    def score_and_filter(docs: List[Document]) -> List[Document]:
-        if not docs:
-            return []
-        doc_vecs = embeddings.embed_documents([doc.page_content for doc in docs])
-        scored = [
-            (doc, cosine_similarity(query_vec, vec))
-            for doc, vec in zip(docs, doc_vecs)
-        ]
-        survivors = [doc for doc, score in scored if score >= threshold]
-        if not survivors:
-            best_doc, _ = max(scored, key=lambda pair: pair[1])
-            survivors = [best_doc]
-        return survivors
-
-    return score_and_filter(dense_docs), score_and_filter(splade_docs)
-
-
 # =====================================================================
 # 3. VECTORSTORE & HYBRID SEARCH LOADER
 # =====================================================================
@@ -543,25 +332,13 @@ def generate_single_response(
     final_top_k: int = 6,
     filter_variant_key: str = "filter_v1",
     rag_variant_key: str = "rag_v1",
-    use_query_expansion: bool = None,
-    use_hyde: bool = None,
-    use_relevance_filtering: bool = None,
-    query_processor_model: str = "qwen3.5:2b",
+    use_query_expansion: bool = False,
+    use_hyde: bool = False,
+    query_processor_model: str = "qwen2.5:1.5b",
     splade_use_gpu: bool = True,
     splade_batch_size: int = 64,
 ):
     start_time = time.time()
-
-    # Resolve toggles from config.py when the caller doesn't explicitly
-    # pass one. This lets GlobalConfig act as the default behavior for
-    # each, while still letting a caller (e.g. UI controls) override any
-    # of them per-request by passing True/False explicitly.
-    if use_query_expansion is None:
-        use_query_expansion = GlobalConfig.SPARSE_QUERY_PROCESSING
-    if use_hyde is None:
-        use_hyde = GlobalConfig.DENSE_QUERY_PROCESSING
-    if use_relevance_filtering is None:
-        use_relevance_filtering = GlobalConfig.RELEVANCE_FILTERING_ENABLED
 
     # Stage 0: Query Processing (optional)
     sparse_query = query
@@ -590,29 +367,6 @@ def generate_single_response(
         search_kwargs={"k": int(top_k)}
     ).invoke(dense_query)
     splade_docs = splade_retriever.invoke(sparse_query, top_k=int(top_k))
-
-    # Stage 1.5: Cross-retriever deduplication -- drop near-duplicate
-    # chunks (threshold from GlobalConfig.DEDUP_OVERLAP_THRESHOLD) between/
-    # within the dense and sparse pools before fusion, so RRF isn't handed
-    # two near-identical passages competing for separate top_k slots. Of
-    # any duplicate group, the copy with the better rank in its own list
-    # wins -- dense isn't automatically preferred over sparse.
-    dense_docs, splade_docs = deduplicate_dense_sparse(dense_docs, splade_docs)
-
-    # Stage 1.6: Relevancy scoring & filtering (optional) -- drop chunks
-    # that don't clear GlobalConfig.RELEVANCE_SCORE_THRESHOLD against the
-    # raw query, scored uniformly across dense- and sparse-sourced chunks.
-    # Gated by use_relevance_filtering so that when disabled, no extra
-    # embedding calls are made at all -- not just a threshold that happens
-    # to let everything through.
-    if use_relevance_filtering:
-        embedder = resolve_embedder(vectorstore, embedding_model)
-        dense_docs, splade_docs = filter_by_relevance(
-            query=query,
-            dense_docs=dense_docs,
-            splade_docs=splade_docs,
-            embeddings=embedder,
-        )
 
     initial_docs = reciprocal_rank_fusion(
         [dense_docs, splade_docs],

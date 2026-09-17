@@ -1,12 +1,8 @@
 # prompts.py
+CRITIQUE_PROMPT = """You are an AI assistant helping to filter search results. 
+Review the CANDIDATE CHUNKS and determine if they are helpful for the USER QUERY.
 
-CRITIQUE_PROMPT = """You are a critical reasoning assistant.
-Given a question and retrieved passages, think step by step:
-1. What information is needed to answer the question?
-2. Which chunks contain that information?
-3. Extract only those passages word-for-word.
-4. If nothing helps, output: NOT_RELEVANT
-"""
+Be conservative: If a chunk seems even partially helpful or contains information related to the query's core topic, keep it. """
 
 CRITIQUE_VARIANTS = {
     "critique_v1": CRITIQUE_PROMPT,

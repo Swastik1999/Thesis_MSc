@@ -23,8 +23,6 @@ def ui_wrapper(
     top_k,
     final_top_k,
     temperature,
-    sparse_query_processing,
-    dense_query_processing,
 ):
     if not user_query or not user_query.strip():
         return "[WARNING] Please enter a question.", "", "0s"
@@ -73,8 +71,6 @@ def ui_wrapper(
             top_k=k_val,          # Passes 25 (Initial candidate pool)
             final_top_k=f_top_k,  # Keeps 6 (Post-critique pool)
             temperature=temp_val,
-            use_query_expansion=sparse_query_processing,
-            use_hyde=dense_query_processing,
         )
 
         # Fallback safeguard in case retrieved_context is empty or None
@@ -156,22 +152,9 @@ def launch_ui():
                     label="Temperature",
                 )
 
-                gr.Markdown("### 3. Query Processing")
-
-                sparse_query_processing = gr.Dropdown(
-                    choices=[("Enabled", True), ("Disabled", False)],
-                    value=GlobalConfig.SPARSE_QUERY_PROCESSING,
-                    label="Sparse Query Processing (Query Expansion)",
-                )
-                dense_query_processing = gr.Dropdown(
-                    choices=[("Enabled", True), ("Disabled", False)],
-                    value=GlobalConfig.DENSE_QUERY_PROCESSING,
-                    label="Dense Query Processing (HyDE)",
-                )
-
             # Right Panel: Prompts Selection, User Query, and Output
             with gr.Column(scale=2):
-                gr.Markdown("### 4. Prompt Variants")
+                gr.Markdown("### 3. Prompt Variants")
 
                 rag_prompt_choice = gr.Dropdown(
                     choices=RAG_PROMPT_KEYS,
@@ -185,7 +168,7 @@ def launch_ui():
                     label="Select Critique Prompt Variant",
                 )
 
-                gr.Markdown("### 5. User Query")
+                gr.Markdown("### 4. User Query")
                 user_query = gr.Textbox(
                     label="User Question",
                     placeholder="Ask something about the text dataset...",
@@ -220,8 +203,6 @@ def launch_ui():
                 top_k,
                 final_top_k,
                 temperature,
-                sparse_query_processing,
-                dense_query_processing,
             ],
             outputs=[answer_out, context_out, latency_out],
         )
