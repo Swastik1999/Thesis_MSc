@@ -38,8 +38,8 @@ CRITIQUE_MODEL = GlobalConfig.CRITIQUE_MODELS[2]    # "qwen3.5:2b"
 QUERY_PROCESSOR_MODEL = getattr(GlobalConfig, "QUERY_PROCESSOR_MODEL", "qwen3.5:2b")
 
 # Chunking & Retrieval hyperparameters
-CHUNK_SIZE = GlobalConfig.CHUNK_SIZE_RANGE[0]       # 800
-CHUNK_OVERLAP = GlobalConfig.CHUNK_OVERLAP_RANGE[0] # 150
+CHUNK_SIZE = 600     # 800
+CHUNK_OVERLAP = 200 # 150
 TOP_K = 15            # 20
 FINAL_TOP_K = 7                                     # Set to 5
 

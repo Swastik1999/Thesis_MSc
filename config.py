@@ -31,7 +31,7 @@ class GlobalConfig:
     # Minimum token overlap (0-1) for a dense-retrieved chunk and a
     # sparse-retrieved chunk to be treated as near-duplicates and collapsed
     # into one before RRF fusion. See pipeline.deduplicate_dense_sparse().
-    DEDUP_OVERLAP_THRESHOLD = 0.60
+    DEDUP_OVERLAP_THRESHOLD = 0.50
 
     # Master switch for whether the relevancy-filtering stage
     # (pipeline.filter_by_relevance()) runs at all. When False, no extra
@@ -51,3 +51,5 @@ class GlobalConfig:
     # score distribution for your embedding model.
     # See pipeline.filter_by_relevance().
     RELEVANCE_SCORE_THRESHOLD = 0.3
+
+    RETRIEVAL_TEST_JSON_PATH = os.path.join("Data", "rag_evaluation_dataset_2.json")
